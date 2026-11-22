@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+target
+ledgerly.db
+ledgerly.db-shm
+ledgerly.db-wal
+docs

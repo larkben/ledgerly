@@ -16,6 +16,10 @@ cargo run
 
 Open <http://localhost:8080>. The app creates its MongoDB collections and unique indexes on startup. It also loads a local `.env` file when present. Keep MongoDB credentials out of source control and configure `COOKIE_SECURE=true` when serving over HTTPS. Put the app behind HTTPS before exposing it publicly.
 
+## Deploy on Railway with Docker
+
+Railway can build this repository from the included `Dockerfile`. In the service's **Variables**, set `MONGODB_URI` to your MongoDB connection string and optionally set `MONGODB_DATABASE`, `ADMIN_EMAILS`, and `COOKIE_SECURE=true`. Railway supplies `PORT`; the app binds to it automatically. Make sure your MongoDB provider allows connections from the Railway service. Do not add database credentials to the Dockerfile or commit a `.env` file.
+
 Set `ADMIN_EMAILS` to a comma-separated list of trusted administrator email addresses before starting the server. Register with one of those addresses to see **User admin** in the sidebar. The server checks this allowlist for every admin API request; hiding the navigation alone does not grant or protect admin access. Set `COOKIE_SECURE=true` when serving over HTTPS.
 
 ## Privacy design
