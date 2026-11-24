@@ -17,3 +17,4 @@ futures-util = "0.3"
 chrono = { version = "0.4", features = ["clock"] }
 dotenvy = "0.15"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
