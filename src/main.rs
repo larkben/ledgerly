@@ -16,7 +16,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
 };
-use chrono::{Datelike, Duration, NaiveDate, Timelike, Utc, Weekday};
+use chrono::{Duration, Utc};
 use futures_util::TryStreamExt;
 use mongodb::{
     Client, Collection, IndexModel,
@@ -32,8 +32,6 @@ struct AppState {
     finance: Collection<Document>,
     logins: Collection<Document>,
     sessions: Mutex<HashMap<String, (String, Vec<u8>)>>,
-    market_history: Collection<Document>,
-    market_symbols: Collection<Document>,
 }
 #[derive(Deserialize)]
 struct Credentials {
@@ -477,12 +475,7 @@ async fn get_finance(state: web::Data<AppState>, req: HttpRequest) -> impl Respo
     };
     let found = state.finance.find_one(doc! { "user_id": user_id }).await;
     match found {
-        Ok(Some(row)) => match row.get_str("payload").ok().and_then(|v| open(&key, v).ok()) { Some(bytes) => {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                sync_market_symbols(&state.market_symbols, &value).await;
-            }
-            HttpResponse::Ok().content_type("application/json").body(bytes)
-        }, None => HttpResponse::InternalServerError().finish() },
+        Ok(Some(row)) => match row.get_str("payload").ok().and_then(|v| open(&key, v).ok()) { Some(bytes) => HttpResponse::Ok().content_type("application/json").body(bytes), None => HttpResponse::InternalServerError().finish() },
         Ok(None) => HttpResponse::Ok().json(serde_json::json!({"accounts":[],"cards":[],"purchases":[],"subscriptions":[],"goals":[],"debts":[],"investments":[],"retirement":[],"retirementSettings":{"annualRate":10,"years":30}})),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
@@ -516,294 +509,7 @@ async fn save_finance(
     {
         return HttpResponse::InternalServerError().finish();
     }
-    sync_market_symbols(&state.market_symbols, &body.data).await;
     HttpResponse::Ok().json(serde_json::json!({"ok":true}))
-}
-fn market_symbols_from_finance(finance: &serde_json::Value) -> Vec<String> {
-    let mut symbols = std::collections::HashSet::new();
-    for item in finance
-        .get("investments")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let category = item
-            .get("category")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
-        if category.contains("crypto")
-            || !(category.contains("stock")
-                || category.contains("etf")
-                || category.contains("fund"))
-        {
-            continue;
-        }
-        let Some(symbol) = item.get("ticker").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let symbol = symbol.trim().to_ascii_uppercase();
-        if symbol.len() <= 32
-            && !symbol.is_empty()
-            && symbol
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
-        {
-            symbols.insert(symbol);
-        }
-    }
-    let mut symbols: Vec<_> = symbols.into_iter().collect();
-    symbols.sort();
-    symbols
-}
-async fn sync_market_symbols(index: &Collection<Document>, finance: &serde_json::Value) {
-    for ticker in market_symbols_from_finance(finance) {
-        let _ = index
-            .update_one(
-                doc! {"ticker": &ticker},
-                doc! {"$setOnInsert": {"ticker": &ticker}},
-            )
-            .upsert(true)
-            .await;
-    }
-}
-#[get("/api/market-history")]
-async fn get_market_history(state: web::Data<AppState>, req: HttpRequest) -> impl Responder {
-    let Some((_token, user_id, key)) = session(&req, &state) else {
-        return HttpResponse::Unauthorized().finish();
-    };
-    let finance = match state.finance.find_one(doc! {"user_id":&user_id}).await {
-        Ok(Some(row)) => match row
-            .get_str("payload")
-            .ok()
-            .and_then(|blob| open(&key, blob).ok())
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        {
-            Some(value) => value,
-            None => return HttpResponse::InternalServerError().finish(),
-        },
-        Ok(None) => return HttpResponse::Ok().json(Vec::<serde_json::Value>::new()),
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
-    let symbols = market_symbols_from_finance(&finance);
-    if symbols.is_empty() {
-        return HttpResponse::Ok().json(Vec::<serde_json::Value>::new());
-    }
-    let mut cursor = match state
-        .market_history
-        .find(doc! {"ticker":{"$in":symbols}})
-        .sort(doc! {"captured_at":1})
-        .limit(100000)
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
-    let mut grouped: HashMap<String, serde_json::Value> = HashMap::new();
-    while let Ok(Some(row)) = cursor.try_next().await {
-        let (Ok(ticker), Ok(price), Ok(stamp), Ok(session)) = (
-            row.get_str("ticker"),
-            row.get_f64("price"),
-            row.get_str("as_of"),
-            row.get_str("session"),
-        ) else {
-            continue;
-        };
-        let key = format!("{stamp} {session}");
-        let entry = grouped
-            .entry(key.clone())
-            .or_insert_with(|| serde_json::json!({"as_of":stamp,"session":session,"prices":{}}));
-        entry["prices"][ticker] = serde_json::json!(price);
-    }
-    let mut output: Vec<_> = grouped.into_values().collect();
-    output.sort_by(|a, b| a["as_of"].as_str().cmp(&b["as_of"].as_str()));
-    HttpResponse::Ok().json(output)
-}
-fn eastern_now() -> chrono::NaiveDateTime {
-    let utc = Utc::now();
-    let year = utc.year();
-    let dst_start = second_sunday(year, 3)
-        .and_hms_opt(7, 0, 0)
-        .unwrap()
-        .and_utc();
-    let dst_end = first_sunday(year, 11)
-        .and_hms_opt(6, 0, 0)
-        .unwrap()
-        .and_utc();
-    let offset = if utc >= dst_start && utc < dst_end {
-        -4
-    } else {
-        -5
-    };
-    (utc + Duration::hours(offset)).naive_utc()
-}
-fn first_sunday(year: i32, month: u32) -> NaiveDate {
-    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    first + Duration::days((7 - first.weekday().num_days_from_sunday() as i64) % 7)
-}
-fn second_sunday(year: i32, month: u32) -> NaiveDate {
-    first_sunday(year, month) + Duration::days(7)
-}
-async fn collect_scheduled_quotes(
-    history: Collection<Document>,
-    runs: Collection<Document>,
-    symbols_index: Collection<Document>,
-) {
-    let Ok(api_key) = std::env::var("TWELVE_DATA") else {
-        return;
-    };
-    let now = eastern_now();
-    if !matches!(
-        now.weekday(),
-        Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
-    ) {
-        return;
-    }
-    let session = if now.hour() == 9 && now.minute() >= 30 && now.minute() < 40 {
-        "morning"
-    } else if now.hour() == 16 && now.minute() >= 20 && now.minute() < 30 {
-        "close"
-    } else {
-        return;
-    };
-    let date = now.date().to_string();
-    let run_filter = doc! {"date":&date,"session":session};
-    if runs
-        .find_one(run_filter.clone())
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
-    }
-    if runs.insert_one(doc!{"date":&date,"session":session,"status":"running","started_at":mongodb::bson::DateTime::now()}).await.is_err(){return}
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut cursor = match symbols_index.find(doc! {}).await {
-        Ok(cursor) => cursor,
-        Err(_) => return,
-    };
-    let mut symbols = Vec::new();
-    while let Ok(Some(row)) = cursor.try_next().await {
-        if let Ok(ticker) = row.get_str("ticker") {
-            symbols.push(ticker.to_owned());
-        }
-    }
-    symbols.sort();
-    symbols.dedup();
-    if symbols.is_empty() {
-        let _ = runs
-            .delete_one(doc! {"date": &date, "session": session})
-            .await;
-        return;
-    }
-
-    let clock = if session == "morning" {
-        "09:30"
-    } else {
-        "16:20"
-    };
-    let stamp = format!("{date} {clock} ET");
-    let mut saved = 0usize;
-    let mut failed = false;
-    for (batch_index, batch) in symbols.chunks(8).enumerate() {
-        // The Basic plan allows 8 credits per minute. /price is one credit per symbol.
-        if batch_index > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(61)).await;
-        }
-        let mut requests = serde_json::Map::new();
-        for (item_index, ticker) in batch.iter().enumerate() {
-            requests.insert(
-                format!("price_{item_index}"),
-                serde_json::json!({"url": format!("/price?symbol={ticker}")}),
-            );
-        }
-        let response = match client
-            .post("https://api.twelvedata.com/batch")
-            .header("Authorization", format!("apikey {api_key}"))
-            .json(&requests)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => response,
-            _ => {
-                failed = true;
-                continue;
-            }
-        };
-        let payload: serde_json::Value = match response.json().await {
-            Ok(payload) => payload,
-            Err(_) => {
-                failed = true;
-                continue;
-            }
-        };
-        let Some(data) = payload.get("data").and_then(serde_json::Value::as_object) else {
-            failed = true;
-            continue;
-        };
-        let captured_at = mongodb::bson::DateTime::now();
-        let mut records = Vec::new();
-        for (item_index, ticker) in batch.iter().enumerate() {
-            let request_key = format!("price_{item_index}");
-            let Some(item) = data.get(&request_key) else {
-                failed = true;
-                continue;
-            };
-            let response = item.get("response").unwrap_or(item);
-            let price = response
-                .get("price")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .or_else(|| value.as_f64())
-                })
-                .filter(|value| value.is_finite() && *value > 0.0);
-            let Some(price) = price else {
-                failed = true;
-                continue;
-            };
-            let snapshot = match mongodb::bson::to_bson(response) {
-                Ok(snapshot) => snapshot,
-                Err(_) => continue,
-            };
-            records.push(doc! {
-                "ticker": ticker,
-                "price": price,
-                "date": &date,
-                "session": session,
-                "as_of": &stamp,
-                "captured_at": captured_at,
-                "snapshot": snapshot
-            });
-        }
-        if !records.is_empty() {
-            match history.insert_many(records).await {
-                Ok(result) => saved += result.inserted_ids.len(),
-                Err(_) => failed = true,
-            }
-        }
-    }
-    let status = if saved == 0 {
-        "failed"
-    } else if failed {
-        "partial"
-    } else {
-        "complete"
-    };
-    let _ = runs
-        .update_one(
-            run_filter,
-            doc! {"$set": {"status": status, "as_of": &stamp, "ticker_count": saved as i64, "requested_count": symbols.len() as i64, "completed_at": mongodb::bson::DateTime::now()}},
-        )
-        .await;
 }
 #[actix_web::main]
 async fn main() -> io::Result<()> {
@@ -816,9 +522,6 @@ async fn main() -> io::Result<()> {
     let users: Collection<Document> = database.collection("users");
     let finance: Collection<Document> = database.collection("finance_data");
     let logins: Collection<Document> = database.collection("login_events");
-    let market_history: Collection<Document> = database.collection("market_snapshots");
-    let market_runs: Collection<Document> = database.collection("market_runs");
-    let market_symbols: Collection<Document> = database.collection("market_symbols");
     users
         .create_index(
             IndexModel::builder()
@@ -845,54 +548,11 @@ async fn main() -> io::Result<()> {
         )
         .await
         .map_err(io::Error::other)?;
-    market_history
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! {"ticker":1,"date":1,"session":1})
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await
-        .map_err(io::Error::other)?;
-    market_runs
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! {"date":1,"session":1})
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await
-        .map_err(io::Error::other)?;
-    market_symbols
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! {"ticker": 1})
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await
-        .map_err(io::Error::other)?;
-    let scheduled_history = market_history.clone();
-    let scheduled_runs = market_runs.clone();
-    let scheduled_symbols = market_symbols.clone();
-    tokio::spawn(async move {
-        loop {
-            collect_scheduled_quotes(
-                scheduled_history.clone(),
-                scheduled_runs.clone(),
-                scheduled_symbols.clone(),
-            )
-            .await;
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    });
     let state = web::Data::new(AppState {
         users,
         finance,
         logins,
         sessions: Mutex::new(HashMap::new()),
-        market_history,
-        market_symbols,
     });
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".into())
@@ -912,7 +572,6 @@ async fn main() -> io::Result<()> {
             .service(logout)
             .service(get_finance)
             .service(save_finance)
-            .service(get_market_history)
             .service(Files::new("/", "static").index_file("index.html"))
     })
     .bind(("0.0.0.0", port))?

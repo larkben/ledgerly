@@ -18,9 +18,9 @@ Open <http://localhost:8080>. The app creates its MongoDB collections and unique
 
 ## Deploy on Railway with Docker
 
-Railway can build this repository from the included `Dockerfile`. In the service's **Variables**, set `MONGODB_URI` to your MongoDB connection string and optionally set `MONGODB_DATABASE`, `ADMIN_EMAILS`, `TWELVE_DATA` (Twelve Data API key), and `COOKIE_SECURE=true`. Railway supplies `PORT`; the app binds to it automatically. Make sure your MongoDB provider allows connections from the Railway service. Do not add database credentials or API keys to the Dockerfile or commit a populated `.env` file.
+Railway can build this repository from the included `Dockerfile`. In the service's **Variables**, set `MONGODB_URI` to your MongoDB connection string and optionally set `MONGODB_DATABASE`, `ADMIN_EMAILS`, and `COOKIE_SECURE=true`. Railway supplies `PORT`; the app binds to it automatically. Make sure your MongoDB provider allows connections from the Railway service. Do not add database credentials or API keys to the Dockerfile or commit a populated `.env` file.
 
-The Twelve Data scheduler runs on weekdays at 9:30 AM ET (8:30 AM Central) and 4:20 PM ET. It requests only distinct stock, ETF, and fund tickers entered by users, using `/price` through the batch endpoint, and stores those snapshots in MongoDB for portfolio history. The shared `market_symbols` collection contains ticker symbols only; it does not store user IDs, balances, or account details. Symbols are added when a user loads or saves their finance data, so existing users are indexed the next time they sign in. Requests are grouped in batches of up to eight symbols to stay within the Basic plan's 8-credit-per-minute limit. Each symbol costs one API credit per run; larger portfolios take longer to refresh. No user can trigger a quote update.
+Investment values are entered and updated manually. Update a holding's units, price, and cost basis from the Investments page; the app keeps the latest portfolio value for each date for its history chart. No market data provider or API key is required.
 
 Set `ADMIN_EMAILS` to a comma-separated list of trusted administrator email addresses before starting the server. Register with one of those addresses to see **User admin** in the sidebar. The server checks this allowlist for every admin API request; hiding the navigation alone does not grant or protect admin access. Set `COOKIE_SECURE=true` when serving over HTTPS.
 
@@ -39,7 +39,7 @@ Users receive a high-entropy recovery code when they register, and older account
 - Card list and manually logged purchases
 - Category search and spending summaries
 - Subscription tracking and savings goals
-- Investment holdings with user-entered units and cost basis, twice-daily full-market stock snapshots, per-holding portfolio history, colored category allocation with a bar/pie toggle, and unrealized P/L
+- Manually valued investment holdings with price history, colored category allocation with a bar/pie toggle, and unrealized P/L
 - Editable and removable purchase history with matching category colors
 - Manually tracked cards with masked last-four display and name-derived colors
 - Separate retirement accounts with user-entered balances, contributions, and adjustable growth projections
